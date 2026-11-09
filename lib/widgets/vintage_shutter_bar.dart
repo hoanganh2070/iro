@@ -32,7 +32,7 @@ class VintageShutterBar extends StatelessWidget {
         children: [
           // Gallery thumbnail
           _SideButton(
-            label: 'GALLERY',
+            label: 'ROLL',
             onTap: onOpenGallery,
             child: Container(
               width: 54,

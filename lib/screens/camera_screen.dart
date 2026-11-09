@@ -6,19 +6,21 @@ import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:gal/gal.dart';
 import 'package:image/image.dart' as img;
+import 'package:saver_gallery/saver_gallery.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../lut.dart';
 import '../models/film_model.dart';
 import '../theme.dart';
+import '../services/photo_store.dart';
 import '../utils/date_stamp_painter.dart';
 import '../widgets/camera_hud.dart';
 import '../widgets/film_shelf_sheet.dart';
 import '../widgets/focal_length_selector.dart';
 import '../widgets/settings_sheet.dart';
 import '../widgets/vintage_shutter_bar.dart';
+import 'film_roll_screen.dart';
 
 /// JPEG encoding runs in a background isolate.
 ///
@@ -84,6 +86,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   ui.FragmentProgram? _lutProgram;
   ui.FragmentShader? _previewShader;
   ui.Image? _fujiLogo;
+  Rect? _logoSrc; // opaque part of the logo (transparent padding trimmed)
   SharedPreferences? _prefs;
 
   // Tap-to-focus
@@ -133,6 +136,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     final saved = _prefs?.getInt('filmIndex') ?? 3;
     _curFilmIndex = (saved >= 0 && saved < FilmModel.fujiCatalog.length) ? saved : 3;
 
+    _refreshLastThumb();
+
     // Start the camera first so the preview shows up quickly,
     // load the heavy LUT assets in parallel.
     final assetsFuture = _loadAssets();
@@ -156,6 +161,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       final logoBytes = await rootBundle.load('assets/images/fujifilm_logo.png');
       final codec = await ui.instantiateImageCodec(logoBytes.buffer.asUint8List());
       _fujiLogo = (await codec.getNextFrame()).image;
+      _logoSrc = await _opaqueBounds(_fujiLogo!);
     } catch (_) {}
 
     try {
@@ -283,23 +289,34 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       final file = await ctrl.takePicture();
       final bytes = await file.readAsBytes();
 
+      final film = FilmModel.fujiCatalog[_curFilmIndex];
+      final now = DateTime.now();
       final result = await _processPhoto(bytes);
 
-      if (!await Gal.hasAccess()) {
-        final granted = await Gal.requestAccess();
-        if (!granted) throw 'Photo library permission was denied';
+      // 1. Private copy for the in-app film roll (never lost).
+      await PhotoStore.save(result.bytes, result.ext, film.id, now);
+
+      // 2. Public copy in DCIM so it shows up in the system gallery.
+      String? dcimError;
+      try {
+        final res = await SaverGallery.saveImage(
+          result.bytes,
+          fileName: 'FUJI_${now.millisecondsSinceEpoch}.${result.ext}',
+          skipIfExists: false,
+        );
+        if (!res.isSuccess) dcimError = res.errorMessage ?? 'unknown error';
+      } catch (e) {
+        dcimError = '$e';
       }
-      await Gal.putImageBytes(
-        result.bytes,
-        name: 'FUJI_${DateTime.now().millisecondsSinceEpoch}.${result.ext}',
-      );
 
       if (!mounted) return;
       setState(() {
         _lastThumb = result.bytes;
         if (_shotsRemaining > 1) _shotsRemaining--;
       });
-      _showToast('Saved to your photo library');
+      _showToast(dcimError == null
+          ? 'Saved to your gallery and film roll'
+          : 'Saved to film roll, but not to your gallery: $dcimError');
     } catch (e, st) {
       debugPrint('Capture failed: $e\n$st');
       _showToast('Capture failed: $e');
@@ -329,14 +346,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       }
     }
     final codec = await desc.instantiateCodec(targetWidth: tw, targetHeight: th);
-    final rawImage = (await codec.getNextFrame()).image;
+    final decoded = (await codec.getNextFrame()).image;
     codec.dispose();
     desc.dispose();
     buffer.dispose();
+    // Crop to the same 3:4 frame the viewfinder shows (WYSIWYG).
+    final rawImage = await _cropToFrame(decoded);
+    decoded.dispose();
 
     final w = rawImage.width.toDouble();
     final h = rawImage.height.toDouble();
-    final barH = _watermark ? (math.max(w, h) * 0.062).roundToDouble() : 0.0;
+    final barH = _watermark ? (math.max(w, h) * 0.075).roundToDouble() : 0.0;
     final totalH = h + barH;
 
     final recorder = ui.PictureRecorder();
@@ -406,6 +426,59 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     return result;
   }
 
+  Future<ui.Image> _cropToFrame(ui.Image src) async {
+    final sw = src.width.toDouble(), sh = src.height.toDouble();
+    final target = sw >= sh ? 4 / 3 : 3 / 4; // width / height
+    var cw = sw, ch = sh;
+    if (sw / sh > target) {
+      cw = sh * target;
+    } else {
+      ch = sw / target;
+    }
+    final cwi = cw.round(), chi = ch.round();
+    if (cwi == src.width && chi == src.height) {
+      return src.clone();
+    }
+    final rec = ui.PictureRecorder();
+    final cv = Canvas(rec);
+    cv.drawImageRect(
+      src,
+      Rect.fromLTWH((sw - cw) / 2, (sh - ch) / 2, cw, ch),
+      Rect.fromLTWH(0, 0, cwi.toDouble(), chi.toDouble()),
+      Paint()..filterQuality = FilterQuality.high,
+    );
+    return rec.endRecording().toImage(cwi, chi);
+  }
+
+  Future<Rect> _opaqueBounds(ui.Image im) async {
+    final full = Rect.fromLTWH(0, 0, im.width.toDouble(), im.height.toDouble());
+    final bd = await im.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (bd == null) return full;
+    final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+    var minX = im.width, minY = im.height, maxX = -1, maxY = -1;
+    for (var y = 0; y < im.height; y++) {
+      final row = y * im.width * 4;
+      for (var x = 0; x < im.width; x++) {
+        if (px[row + x * 4 + 3] > 20) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return full;
+    return Rect.fromLTRB(minX.toDouble(), minY.toDouble(), maxX + 1.0, maxY + 1.0);
+  }
+
+  Future<void> _refreshLastThumb() async {
+    try {
+      final list = await PhotoStore.load();
+      final bytes = list.isEmpty ? null : await list.last.file.readAsBytes();
+      if (mounted) setState(() => _lastThumb = bytes);
+    } catch (_) {}
+  }
+
   String _wmDate(DateTime d) {
     String two(int v) => v.toString().padLeft(2, '0');
     return '${d.year}.${two(d.month)}.${two(d.day)}  ${two(d.hour)}:${two(d.minute)}';
@@ -419,11 +492,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     final pad = s.height * 0.5;
     final logo = _fujiLogo;
     if (logo != null) {
-      final lh = s.height * 0.30;
-      final lw = lh * logo.width / logo.height;
+      final src = _logoSrc ?? Rect.fromLTWH(0, 0, logo.width.toDouble(), logo.height.toDouble());
+      // Logo is about 24% of the image width, but never taller than half the bar.
+      var lw = s.width * 0.24;
+      var lh = lw * src.height / src.width;
+      if (lh > s.height * 0.5) {
+        lh = s.height * 0.5;
+        lw = lh * src.width / src.height;
+      }
       c.drawImageRect(
         logo,
-        Rect.fromLTWH(0, 0, logo.width.toDouble(), logo.height.toDouble()),
+        src,
         Rect.fromLTWH(pad, (s.height - lh) / 2, lw, lh),
         Paint()
           ..colorFilter = ColorFilter.mode(
@@ -529,11 +608,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   Future<void> _openGallery() async {
-    try {
-      await Gal.open();
-    } catch (_) {
-      _showToast('Could not open the photo library');
-    }
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const FilmRollScreen()),
+    );
+    _refreshLastThumb();
   }
 
   // ───────────────────────── UI ─────────────────────────

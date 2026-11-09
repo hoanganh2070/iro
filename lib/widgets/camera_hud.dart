@@ -43,29 +43,36 @@ class CameraHud extends StatelessWidget {
             ),
           ),
 
-          // Bottom row
+          // Bottom row (scales down instead of overflowing on narrow screens)
           Positioned(
             left: 22,
             right: 22,
             bottom: 22,
             child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Row(
-                  children: [
-                    _Badge(
-                      child: Row(mainAxisSize: MainAxisSize.min, children: [
-                        const RedDot(size: 7),
-                        const SizedBox(width: 6),
-                        _txt(filmCode),
-                      ]),
+                Expanded(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _Badge(
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            const RedDot(size: 7),
+                            const SizedBox(width: 6),
+                            _txt(filmCode),
+                          ]),
+                        ),
+                        const SizedBox(width: 5),
+                        _Badge(child: _txt('EV $ev')),
+                        const SizedBox(width: 5),
+                        _Badge(child: _txt('WB 5500K')),
+                      ],
                     ),
-                    const SizedBox(width: 6),
-                    _Badge(child: _txt('EV $ev')),
-                    const SizedBox(width: 6),
-                    _Badge(child: _txt('WB 5500K')),
-                  ],
+                  ),
                 ),
+                const SizedBox(width: 6),
                 _Badge(
                   accent: true,
                   child: Row(mainAxisSize: MainAxisSize.min, children: [
